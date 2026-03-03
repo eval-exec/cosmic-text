@@ -8,6 +8,8 @@ use core::fmt;
 use core::ops::{Deref, DerefMut};
 use fontdb::{FaceInfo, Query, Style};
 use skrifa::raw::{ReadError, TableProvider as _};
+use skrifa::MetadataProvider;
+use skrifa::Tag;
 
 // re-export fontdb and harfrust
 pub use fontdb;
@@ -28,11 +30,9 @@ pub struct FontMatchKey {
 }
 
 impl FontMatchKey {
-    fn new(attrs: &Attrs, face: &FaceInfo) -> FontMatchKey {
+    fn new(attrs: &Attrs, face: &FaceInfo, font_weight_diff: u16) -> FontMatchKey {
         // TODO: smarter way of detecting emoji
         let not_emoji = !face.post_script_name.contains("Emoji");
-        // TODO: correctly take variable axes into account
-        let font_weight_diff = attrs.weight.0.abs_diff(face.weight.0);
         let font_weight = face.weight.0;
         let font_stretch_diff = attrs.stretch.to_number().abs_diff(face.stretch.to_number());
         let font_stretch = face.stretch.to_number();
@@ -57,6 +57,26 @@ impl FontMatchKey {
             id,
         }
     }
+}
+
+#[inline]
+fn compute_font_weight_diff(
+    requested_weight: u16,
+    face_weight: u16,
+    variable_weight_axis_range: Option<(u16, u16)>,
+) -> u16 {
+    if let Some((min_weight, max_weight)) = variable_weight_axis_range {
+        if requested_weight < min_weight {
+            return min_weight - requested_weight;
+        }
+        if requested_weight > max_weight {
+            return requested_weight - max_weight;
+        }
+        // Requested weight can be represented by this variable font face.
+        return 0;
+    }
+
+    requested_weight.abs_diff(face_weight)
 }
 
 struct FontCachedCodepointSupportInfo {
@@ -139,6 +159,10 @@ pub struct FontSystem {
 
     /// Cache for font codepoint support info
     font_codepoint_support_info_cache: HashMap<fontdb::ID, FontCachedCodepointSupportInfo>,
+
+    /// Cache for variable font weight axis ranges (`wght`) per face id.
+    /// `None` means this face has no weight axis.
+    font_weight_axis_range_cache: HashMap<fontdb::ID, Option<(u16, u16)>>,
 
     /// Cache for font matches.
     font_matches_cache: HashMap<FontMatchAttrs, Arc<Vec<FontMatchKey>>>,
@@ -253,6 +277,7 @@ impl FontSystem {
             font_cache: HashMap::default(),
             font_matches_cache: HashMap::default(),
             font_codepoint_support_info_cache: HashMap::default(),
+            font_weight_axis_range_cache: HashMap::default(),
             monospace_fallbacks_buffer: BTreeSet::default(),
             #[cfg(feature = "shape-run-cache")]
             shape_run_cache: crate::ShapeRunCache::default(),
@@ -280,6 +305,7 @@ impl FontSystem {
     /// Get a mutable reference to the database.
     pub fn db_mut(&mut self) -> &mut fontdb::Database {
         self.font_matches_cache.clear();
+        self.font_weight_axis_range_cache.clear();
         &mut self.db
     }
 
@@ -353,58 +379,97 @@ impl FontSystem {
             self.font_matches_cache.clear();
         }
 
+        let cache_key: FontMatchAttrs = attrs.into();
+        if let Some(cached) = self.font_matches_cache.get(&cache_key) {
+            return Arc::clone(cached);
+        }
+
+        #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+        let now = std::time::Instant::now();
+
+        let face_ids = self.db.faces().map(|face| face.id).collect::<Vec<_>>();
+        let mut font_match_keys = Vec::with_capacity(face_ids.len());
+
+        for id in face_ids {
+            let variable_weight_axis_range = self.face_weight_axis_range(id);
+            if let Some(face) = self.db.face(id) {
+                let font_weight_diff = compute_font_weight_diff(
+                    attrs.weight.0,
+                    face.weight.0,
+                    variable_weight_axis_range,
+                );
+                font_match_keys.push(FontMatchKey::new(attrs, face, font_weight_diff));
+            }
+        }
+
+        // Sort so we get the keys with weight_offset=0 first
+        font_match_keys.sort();
+
+        // db.query is better than above, but returns just one font
+        let query = Query {
+            families: &[attrs.family],
+            weight: attrs.weight,
+            stretch: attrs.stretch,
+            style: attrs.style,
+        };
+
+        if let Some(id) = self.db.query(&query) {
+            if let Some(i) = font_match_keys
+                .iter()
+                .enumerate()
+                .find(|(_i, key)| key.id == id)
+                .map(|(i, _)| i)
+            {
+                // if exists move to front
+                let match_key = font_match_keys.remove(i);
+                font_match_keys.insert(0, match_key);
+            } else {
+                let variable_weight_axis_range = self.face_weight_axis_range(id);
+                if let Some(face) = self.db.face(id) {
+                    // else insert in front
+                    let font_weight_diff = compute_font_weight_diff(
+                        attrs.weight.0,
+                        face.weight.0,
+                        variable_weight_axis_range,
+                    );
+                    let match_key = FontMatchKey::new(attrs, face, font_weight_diff);
+                    font_match_keys.insert(0, match_key);
+                } else {
+                    log::error!("Could not get face from db, that should've been there.");
+                }
+            }
+        }
+
+        #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+        {
+            let elapsed = now.elapsed();
+            log::debug!("font matches for {attrs:?} in {elapsed:?}");
+        }
+
+        let result = Arc::new(font_match_keys);
         self.font_matches_cache
-            //TODO: do not create AttrsOwned unless entry does not already exist
-            .entry(attrs.into())
-            .or_insert_with(|| {
-                #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
-                let now = std::time::Instant::now();
+            .insert(cache_key, Arc::clone(&result));
+        result
+    }
 
-                let mut font_match_keys = self
-                    .db
-                    .faces()
-                    .map(|face| FontMatchKey::new(attrs, face))
-                    .collect::<Vec<_>>();
+    fn face_weight_axis_range(&mut self, id: fontdb::ID) -> Option<(u16, u16)> {
+        if let Some(cached) = self.font_weight_axis_range_cache.get(&id) {
+            return *cached;
+        }
 
-                // Sort so we get the keys with weight_offset=0 first
-                font_match_keys.sort();
-
-                // db.query is better than above, but returns just one font
-                let query = Query {
-                    families: &[attrs.family],
-                    weight: attrs.weight,
-                    stretch: attrs.stretch,
-                    style: attrs.style,
-                };
-
-                if let Some(id) = self.db.query(&query) {
-                    if let Some(i) = font_match_keys
-                        .iter()
-                        .enumerate()
-                        .find(|(_i, key)| key.id == id)
-                        .map(|(i, _)| i)
-                    {
-                        // if exists move to front
-                        let match_key = font_match_keys.remove(i);
-                        font_match_keys.insert(0, match_key);
-                    } else if let Some(face) = self.db.face(id) {
-                        // else insert in front
-                        let match_key = FontMatchKey::new(attrs, face);
-                        font_match_keys.insert(0, match_key);
-                    } else {
-                        log::error!("Could not get face from db, that should've been there.");
-                    }
-                }
-
-                #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
-                {
-                    let elapsed = now.elapsed();
-                    log::debug!("font matches for {attrs:?} in {elapsed:?}");
-                }
-
-                Arc::new(font_match_keys)
+        let range = self
+            .db
+            .with_face_data(id, |font_data, face_index| {
+                let font = skrifa::FontRef::from_index(font_data, face_index).ok()?;
+                let axis = font.axes().get_by_tag(Tag::new(b"wght"))?;
+                let min = axis.min_value().round().clamp(1.0, 1000.0) as u16;
+                let max = axis.max_value().round().clamp(1.0, 1000.0) as u16;
+                Some((min.min(max), min.max(max)))
             })
-            .clone()
+            .flatten();
+
+        self.font_weight_axis_range_cache.insert(id, range);
+        range
     }
 
     #[cfg(feature = "std")]
@@ -465,5 +530,30 @@ impl<T> Deref for BorrowedWithFontSystem<'_, T> {
 impl<T> DerefMut for BorrowedWithFontSystem<'_, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.inner
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compute_font_weight_diff;
+
+    #[test]
+    fn static_font_weight_diff_uses_face_weight() {
+        assert_eq!(compute_font_weight_diff(700, 400, None), 300);
+    }
+
+    #[test]
+    fn variable_font_weight_in_range_is_exact_match() {
+        assert_eq!(compute_font_weight_diff(700, 400, Some((100, 900))), 0);
+    }
+
+    #[test]
+    fn variable_font_weight_below_range_uses_lower_bound_diff() {
+        assert_eq!(compute_font_weight_diff(100, 400, Some((200, 900))), 100);
+    }
+
+    #[test]
+    fn variable_font_weight_above_range_uses_upper_bound_diff() {
+        assert_eq!(compute_font_weight_diff(950, 400, Some((200, 900))), 50);
     }
 }
