@@ -309,6 +309,16 @@ impl FontSystem {
         &mut self.db
     }
 
+    /// Insert one face without changing any existing face or family alias.
+    ///
+    /// Matching must consider the new face, but cached metadata for existing
+    /// face IDs remains valid. The database assigns a fresh ID, replacing the
+    /// supplied `info.id`. Use [`Self::db_mut`] for arbitrary mutation instead.
+    pub fn push_font_face(&mut self, info: fontdb::FaceInfo) -> fontdb::ID {
+        self.font_matches_cache.clear();
+        self.db.push_face_info(info)
+    }
+
     /// Consume this [`FontSystem`] and return the locale and database.
     pub fn into_locale_and_db(self) -> (String, fontdb::Database) {
         (self.locale, self.db)
